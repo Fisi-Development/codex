@@ -700,6 +700,7 @@ pub(crate) fn effective_write_roots_for_permissions(
     let write_roots = expand_user_profile_root(write_roots);
     let write_roots = filter_user_profile_root(write_roots);
     let write_roots = filter_user_profile_root_exclusions(write_roots);
+    let write_roots = filter_broad_user_profile_write_roots(write_roots);
     let write_roots = filter_ssh_config_dependency_roots(write_roots);
     filter_sensitive_write_roots(write_roots, codex_home)
 }
@@ -1391,6 +1392,31 @@ fn filter_user_profile_root_exclusions(mut roots: Vec<PathBuf>) -> Vec<PathBuf> 
     };
     let user_profile = Path::new(&user_profile);
     roots.retain(|root| !is_user_profile_root_exclusion(root, user_profile));
+    roots
+}
+
+fn filter_broad_user_profile_write_roots(roots: Vec<PathBuf>) -> Vec<PathBuf> {
+    let Ok(user_profile) = std::env::var("USERPROFILE") else {
+        return roots;
+    };
+    filter_broad_user_profile_write_roots_for(roots, Path::new(&user_profile))
+}
+
+fn filter_broad_user_profile_write_roots_for(
+    mut roots: Vec<PathBuf>,
+    user_profile: &Path,
+) -> Vec<PathBuf> {
+    // Inheriting ACE grants walk the whole tree: these directories hold per-user AppX state
+    // and millions of files. Keep deeper explicit roots, such as AppData/Local/Temp.
+    let app_data = user_profile.join("AppData");
+    let broad_root_keys = [
+        app_data.clone(),
+        app_data.join("Local"),
+        app_data.join("Roaming"),
+        app_data.join("LocalLow"),
+    ]
+    .map(|root| canonical_path_key(&root));
+    roots.retain(|root| !broad_root_keys.contains(&canonical_path_key(root)));
     roots
 }
 
@@ -2362,6 +2388,67 @@ mod tests {
         let expected: HashSet<PathBuf> = [documents, excluded, other_root].into_iter().collect();
 
         assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn filter_broad_user_profile_write_roots_for_drops_broad_appdata_roots() {
+        let tmp = TempDir::new().expect("tempdir");
+        let user_profile = tmp.path().join("user-profile");
+        let app_data = user_profile.join("AppData");
+        let mut roots = vec![
+            app_data.clone(),
+            app_data.join("Local"),
+            app_data.join("Roaming"),
+            app_data.join("LocalLow"),
+        ];
+        for root in &roots {
+            fs::create_dir_all(root).expect("create appdata root");
+        }
+        roots.push(user_profile.join("appdata").join("local"));
+
+        let roots = super::filter_broad_user_profile_write_roots_for(roots, &user_profile);
+
+        assert!(roots.is_empty());
+    }
+
+    #[test]
+    fn filter_broad_user_profile_write_roots_for_keeps_narrow_and_other_roots() {
+        let tmp = TempDir::new().expect("tempdir");
+        let user_profile = tmp.path().join("user-profile");
+        let roots = vec![
+            user_profile.join("AppData").join("Local").join("Temp"),
+            user_profile.join("Documents"),
+            user_profile.join("repo"),
+            tmp.path().join("other-root"),
+        ];
+        for root in &roots {
+            fs::create_dir_all(root).expect("create write root");
+        }
+
+        let actual = super::filter_broad_user_profile_write_roots_for(roots.clone(), &user_profile);
+
+        assert_eq!(roots, actual);
+    }
+
+    #[test]
+    fn expanded_write_roots_drop_broad_appdata_and_excluded_children() {
+        let tmp = TempDir::new().expect("tempdir");
+        let user_profile = tmp.path().join("user-profile");
+        let codex_home = user_profile.join("CodexHome");
+        let documents = user_profile.join("Documents");
+        fs::create_dir_all(&codex_home).expect("create codex home");
+        fs::create_dir_all(&documents).expect("create documents");
+        fs::create_dir_all(user_profile.join("AppData")).expect("create appdata");
+        fs::create_dir_all(user_profile.join(".ssh")).expect("create .ssh");
+
+        let roots = super::expand_user_profile_root_for(vec![user_profile.clone()], &user_profile);
+        let mut roots = super::filter_broad_user_profile_write_roots_for(roots, &user_profile);
+        let user_profile_key = super::canonical_path_key(&user_profile);
+        roots.retain(|root| super::canonical_path_key(root) != user_profile_key);
+        roots.retain(|root| !super::is_user_profile_root_exclusion(root, &user_profile));
+        let roots = super::filter_sensitive_write_roots(roots, &codex_home);
+
+        assert_eq!(vec![documents], roots);
     }
 
     #[test]
