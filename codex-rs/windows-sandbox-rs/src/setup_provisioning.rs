@@ -14,7 +14,7 @@ use crate::SetupErrorReport;
 use crate::SetupFailure;
 use crate::SetupRuntime;
 use crate::acquire_sandbox_setup_lock;
-use crate::add_deny_write_ace;
+use crate::acl::add_deny_write_aces;
 use crate::convert_string_sid_to_sid;
 use crate::ensure_allow_mask_aces_with_inheritance;
 use crate::ensure_allow_write_aces;
@@ -1161,34 +1161,42 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
             &payload.write_roots,
             path,
         )?;
-        for deny_sid_str in deny_sid_strs {
-            let deny_psid = unsafe {
-                convert_string_sid_to_sid(&deny_sid_str)
-                    .ok_or_else(|| anyhow::anyhow!("convert deny capability SID failed"))?
-            };
-
-            match unsafe { add_deny_write_ace(path, deny_psid) } {
-                Ok(true) => {
-                    log_line(
-                        log,
-                        &format!("applied deny ACE to protect {}", path.display()),
-                    )?;
+        let mut deny_psids: Vec<*mut c_void> = Vec::with_capacity(deny_sid_strs.len());
+        for deny_sid_str in &deny_sid_strs {
+            match unsafe { convert_string_sid_to_sid(deny_sid_str) } {
+                Some(psid) => deny_psids.push(psid),
+                None => {
+                    for psid in deny_psids {
+                        unsafe {
+                            LocalFree(psid as HLOCAL);
+                        }
+                    }
+                    anyhow::bail!("convert deny capability SID failed");
                 }
-                Ok(false) => {}
-                Err(err) => {
-                    record_acl_failure(
-                        &mut refresh_errors,
-                        WriteAclOperation::Deny,
-                        path,
-                        &err,
-                        |message| log_line(log, message),
-                    )?;
-                }
-            }
-            unsafe {
-                LocalFree(deny_psid as HLOCAL);
             }
         }
+
+        // One DACL update per path: each inheritable change rewrites the whole tree below it.
+        let logged = match unsafe { add_deny_write_aces(path, &deny_psids) } {
+            Ok(true) => log_line(
+                log,
+                &format!("applied deny ACE to protect {}", path.display()),
+            ),
+            Ok(false) => Ok(()),
+            Err(err) => record_acl_failure(
+                &mut refresh_errors,
+                WriteAclOperation::Deny,
+                path,
+                &err,
+                |message| log_line(log, message),
+            ),
+        };
+        for psid in deny_psids {
+            unsafe {
+                LocalFree(psid as HLOCAL);
+            }
+        }
+        logged?;
     }
 
     lock_sandbox_bin_dir(payload, &sandbox_group_sid)?;
