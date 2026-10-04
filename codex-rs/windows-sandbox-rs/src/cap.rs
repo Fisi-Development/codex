@@ -118,11 +118,20 @@ pub fn workspace_write_cap_sid_for_root(
     cwd: &Path,
     root: &Path,
 ) -> Result<String> {
-    if canonical_path_key(root) == canonical_path_key(cwd) {
+    if canonical_path_key(root) == canonical_path_key(cwd) || is_direct_child_of(root, cwd) {
         workspace_cap_sid_for_cwd(codex_home, cwd)
     } else {
         writable_root_cap_sid_for_path(codex_home, root)
     }
+}
+
+/// A user-profile cwd is split into one write root per profile child. Giving each child its own
+/// SID means a deny carveout outside those roots (such as `~/.codex`) collects one inheritable
+/// deny ACE per child, and every new child forces another ACL walk of that whole tree. Children
+/// of the cwd already belong to the cwd's workspace, so they share its SID.
+fn is_direct_child_of(root: &Path, cwd: &Path) -> bool {
+    root.parent()
+        .is_some_and(|parent| canonical_path_key(parent) == canonical_path_key(cwd))
 }
 
 pub fn workspace_write_root_contains_path(root: &Path, path: &Path) -> bool {
@@ -198,6 +207,35 @@ mod tests {
 
         let caps = load_or_create_cap_sids(&codex_home).expect("load caps");
         assert_eq!(caps.workspace_by_cwd.len(), 1);
+        assert_eq!(caps.writable_root_by_path.len(), 1);
+    }
+
+    #[test]
+    fn direct_children_of_cwd_share_workspace_sid() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let codex_home = temp.path().join("codex-home");
+        std::fs::create_dir_all(&codex_home).expect("create codex home");
+
+        let profile = temp.path().join("profile");
+        let child_dir = profile.join("Documents");
+        let child_file = profile.join("notes.txt");
+        let grandchild = child_dir.join("repo");
+        std::fs::create_dir_all(&grandchild).expect("create profile tree");
+        std::fs::write(&child_file, "x").expect("create child file");
+
+        let workspace_sid =
+            workspace_write_cap_sid_for_root(&codex_home, &profile, &profile).expect("cwd sid");
+        let dir_sid =
+            workspace_write_cap_sid_for_root(&codex_home, &profile, &child_dir).expect("dir sid");
+        let file_sid =
+            workspace_write_cap_sid_for_root(&codex_home, &profile, &child_file).expect("file sid");
+        let grandchild_sid = workspace_write_cap_sid_for_root(&codex_home, &profile, &grandchild)
+            .expect("grandchild sid");
+
+        assert_eq!(dir_sid, workspace_sid);
+        assert_eq!(file_sid, workspace_sid);
+        assert_ne!(grandchild_sid, workspace_sid);
+        let caps = load_or_create_cap_sids(&codex_home).expect("load caps");
         assert_eq!(caps.writable_root_by_path.len(), 1);
     }
 }
