@@ -73,6 +73,39 @@ fn existing_deny_ace_is_visible_without_write_dac() {
 }
 
 #[test]
+fn batched_write_denies_cover_every_missing_sid_and_children() {
+    let parent = tempfile::tempdir().expect("parent directory");
+    let child = parent.path().join("child.txt");
+    std::fs::write(&child, b"x").expect("child file");
+    let existing = LocalSid::from_string("S-1-5-21-10-20-30-50").expect("existing SID");
+    let first_new = LocalSid::from_string("S-1-5-21-10-20-30-51").expect("first new SID");
+    let second_new = LocalSid::from_string("S-1-5-21-10-20-30-52").expect("second new SID");
+    let all = [existing.as_ptr(), first_new.as_ptr(), second_new.as_ptr()];
+
+    unsafe {
+        assert!(super::add_deny_write_ace(parent.path(), existing.as_ptr()).expect("seed deny"));
+        assert!(super::add_deny_write_aces(parent.path(), &all).expect("batched deny"));
+        assert!(!super::add_deny_write_aces(parent.path(), &all).expect("repeat batched deny"));
+
+        let (dacl, descriptor) = super::fetch_dacl_handle(parent.path()).expect("parent DACL");
+        let explicit_denies: Vec<bool> = all
+            .iter()
+            .map(|sid| super::dacl_has_write_deny_for_sid(dacl, *sid))
+            .collect();
+        LocalFree(descriptor as HLOCAL);
+        assert_eq!(explicit_denies, vec![true, true, true]);
+
+        let (child_dacl, child_descriptor) = super::fetch_dacl_handle(&child).expect("child DACL");
+        let inherited_denies: Vec<bool> = all
+            .iter()
+            .map(|sid| super::dacl_has_write_deny_for_sid(child_dacl, *sid))
+            .collect();
+        LocalFree(child_descriptor as HLOCAL);
+        assert_eq!(inherited_denies, vec![true, true, true]);
+    }
+}
+
+#[test]
 fn revoking_absent_sid_preserves_child_null_dacl() {
     let parent = tempfile::tempdir().expect("parent directory");
     let child = parent.path().join("child");
