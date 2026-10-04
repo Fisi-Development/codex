@@ -825,7 +825,18 @@ pub unsafe fn add_allow_ace(path: &Path, psid: *mut c_void) -> Result<bool> {
 /// # Safety
 /// Caller must ensure `psid` points to a valid SID and `path` refers to an existing file or directory.
 pub unsafe fn add_deny_write_ace(path: &Path, psid: *mut c_void) -> Result<bool> {
-    add_deny_ace(path, psid, DenyAceKind::Write)
+    add_deny_ace(path, &[psid], DenyAceKind::Write)
+}
+
+/// Adds write deny ACEs for every SID that lacks one, in a single DACL update.
+///
+/// Each inheritable DACL change makes Windows rewrite every descendant, so adding SIDs one at a
+/// time walks a large tree once per SID.
+///
+/// # Safety
+/// Caller must ensure every entry in `psids` points to a valid SID and `path` exists.
+pub unsafe fn add_deny_write_aces(path: &Path, psids: &[*mut c_void]) -> Result<bool> {
+    add_deny_ace(path, psids, DenyAceKind::Write)
 }
 
 #[derive(Clone, Copy)]
@@ -884,7 +895,7 @@ unsafe fn deny_ace_already_present(
     result
 }
 
-unsafe fn add_deny_ace(path: &Path, psid: *mut c_void, kind: DenyAceKind) -> Result<bool> {
+unsafe fn add_deny_ace(path: &Path, psids: &[*mut c_void], kind: DenyAceKind) -> Result<bool> {
     let handle = match OpenOptions::new()
         .access_mode(READ_CONTROL | WRITE_DAC)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
@@ -900,7 +911,14 @@ unsafe fn add_deny_ace(path: &Path, psid: *mut c_void, kind: DenyAceKind) -> Res
             if matches!(kind, DenyAceKind::Read) {
                 ensure_handle_is_not_filesystem_root(&read_handle, path)?;
             }
-            if deny_ace_already_present(&read_handle, path, psid, kind)? {
+            let mut all_present = true;
+            for psid in psids {
+                if !deny_ace_already_present(&read_handle, path, *psid, kind)? {
+                    all_present = false;
+                    break;
+                }
+            }
+            if all_present {
                 return Ok(false);
             }
             return Err(write_error).context("open deny ACL target for update");
@@ -930,23 +948,34 @@ unsafe fn add_deny_ace(path: &Path, psid: *mut c_void, kind: DenyAceKind) -> Res
             path.display()
         ));
     }
-    let result = if kind.already_present(p_dacl, psid) {
-        Ok(false)
-    } else {
-        let trustee = TRUSTEE_W {
-            pMultipleTrustee: std::ptr::null_mut(),
-            MultipleTrusteeOperation: 0,
-            TrusteeForm: TRUSTEE_IS_SID,
-            TrusteeType: TRUSTEE_IS_UNKNOWN,
-            ptstrName: psid as *mut u16,
-        };
+    let mut entries: Vec<EXPLICIT_ACCESS_W> = Vec::new();
+    for psid in psids {
+        if kind.already_present(p_dacl, *psid) {
+            continue;
+        }
         let mut explicit: EXPLICIT_ACCESS_W = std::mem::zeroed();
         explicit.grfAccessPermissions = kind.mask();
         explicit.grfAccessMode = DENY_ACCESS;
         explicit.grfInheritance = CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE;
-        explicit.Trustee = trustee;
+        explicit.Trustee = TRUSTEE_W {
+            pMultipleTrustee: std::ptr::null_mut(),
+            MultipleTrusteeOperation: 0,
+            TrusteeForm: TRUSTEE_IS_SID,
+            TrusteeType: TRUSTEE_IS_UNKNOWN,
+            ptstrName: *psid as *mut u16,
+        };
+        entries.push(explicit);
+    }
+    let result = if entries.is_empty() {
+        Ok(false)
+    } else {
         let mut p_new_dacl: *mut ACL = std::ptr::null_mut();
-        let code2 = SetEntriesInAclW(1, &explicit, p_dacl, &mut p_new_dacl);
+        let code2 = SetEntriesInAclW(
+            entries.len() as u32,
+            entries.as_ptr(),
+            p_dacl,
+            &mut p_new_dacl,
+        );
         let result = if let Err(err) = acl_api_result(path, "SetEntriesInAclW", code2) {
             Err(err)
         } else {
@@ -1004,7 +1033,7 @@ fn ensure_handle_is_not_filesystem_root(handle: &std::fs::File, path: &Path) -> 
 /// # Safety
 /// Caller must ensure `psid` points to a valid SID and `path` refers to an existing file or directory.
 pub unsafe fn add_deny_read_ace(path: &Path, psid: *mut c_void) -> Result<bool> {
-    add_deny_ace(path, psid, DenyAceKind::Read)
+    add_deny_ace(path, &[psid], DenyAceKind::Read)
 }
 
 #[cfg(test)]
