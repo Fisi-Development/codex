@@ -204,6 +204,9 @@ fn workspace_write_cap_sids_for_path(
             }
         }
     }
+    // Roots that share a SID (children of a profile cwd) would otherwise repeat it once per root.
+    let mut seen = HashSet::new();
+    sid_strs.retain(|sid| seen.insert(sid.clone()));
     Ok(sid_strs)
 }
 
@@ -1245,6 +1248,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use serde_json::json;
     use std::fs;
+    use std::path::PathBuf;
     use windows_sys::Win32::Foundation::HLOCAL;
     use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::Storage::FileSystem::FILE_DELETE_CHILD;
@@ -1522,5 +1526,31 @@ mod tests {
         .expect("deny sids");
 
         assert_eq!(deny_sids, vec![workspace_sid, nested_sid]);
+    }
+
+    #[test]
+    fn deny_path_outside_profile_children_uses_one_workspace_sid() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let codex_home = temp.path().join("codex-home");
+        let profile = temp.path().join("profile");
+        let protected_dir = profile.join(".codex");
+        let children: Vec<PathBuf> = ["Documents", "git", "notes.txt"]
+            .iter()
+            .map(|name| profile.join(name))
+            .collect();
+        fs::create_dir_all(&codex_home).expect("create codex home");
+        fs::create_dir_all(&protected_dir).expect("create protected dir");
+        fs::create_dir_all(&children[0]).expect("create documents");
+        fs::create_dir_all(&children[1]).expect("create git");
+        fs::write(&children[2], "x").expect("create notes");
+
+        let workspace_sid = workspace_write_cap_sid_for_root(&codex_home, &profile, &profile)
+            .expect("workspace sid");
+
+        let deny_sids =
+            workspace_write_cap_sids_for_path(&codex_home, &profile, &children, &protected_dir)
+                .expect("deny sids");
+
+        assert_eq!(deny_sids, vec![workspace_sid]);
     }
 }
