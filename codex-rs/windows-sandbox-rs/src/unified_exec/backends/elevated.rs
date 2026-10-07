@@ -15,6 +15,7 @@ use crate::resolved_permissions::ResolvedWindowsSandboxPermissions;
 use crate::runner_client::RunnerTransport;
 use crate::runner_client::retry_runner_spawn_once;
 use crate::runner_client::spawn_runner_transport;
+use crate::spawn_prep::ElevatedSpawnContext;
 use crate::spawn_prep::prepare_elevated_spawn_context_for_permissions;
 use anyhow::Result;
 use codex_protocol::models::PermissionProfile;
@@ -146,6 +147,56 @@ async fn spawn_runner_transport_task(
     .map_err(|err| anyhow::anyhow!("runner handshake task failed: {err}"))?
 }
 
+struct ElevatedPrepareRequest {
+    permissions: ResolvedWindowsSandboxPermissions,
+    codex_home: PathBuf,
+    cwd: PathBuf,
+    env_map: HashMap<String, String>,
+    command: Vec<String>,
+    read_roots_override: Option<Vec<PathBuf>>,
+    read_roots_include_platform_defaults: bool,
+    write_roots_override: Option<Vec<PathBuf>>,
+    deny_read_paths_override: Vec<PathBuf>,
+    deny_write_paths_override: Vec<PathBuf>,
+    proxy_enforced: bool,
+    proxy_settings_mode: crate::WindowsSandboxProxySettingsMode,
+}
+
+fn prepare_elevated_spawn_context_blocking(
+    mut request: ElevatedPrepareRequest,
+) -> Result<(ElevatedSpawnContext, HashMap<String, String>)> {
+    let elevated = prepare_elevated_spawn_context_for_permissions(
+        request.permissions,
+        &request.codex_home,
+        &request.cwd,
+        &mut request.env_map,
+        &request.command,
+        request.read_roots_override.as_deref(),
+        request.read_roots_include_platform_defaults,
+        request.write_roots_override.as_deref(),
+        &request.deny_read_paths_override,
+        &request.deny_write_paths_override,
+        request.proxy_enforced,
+        request.proxy_settings_mode,
+    )?;
+    Ok((elevated, request.env_map))
+}
+
+/// Runs spawn preparation on the blocking pool.
+///
+/// Preparation can launch the sandbox setup helper and wait for it, which takes
+/// minutes when ACLs need refreshing. Running that wait on an async worker
+/// stalls every task queued on that worker, including the thread's event
+/// listener, so the client sees no events for the whole refresh.
+async fn prepare_elevated_spawn_context_off_runtime<T: Send + 'static>(
+    request: ElevatedPrepareRequest,
+    prepare: impl FnOnce(ElevatedPrepareRequest) -> Result<T> + Send + 'static,
+) -> Result<T> {
+    tokio::task::spawn_blocking(move || prepare(request))
+        .await
+        .map_err(|err| anyhow::anyhow!("sandbox spawn preparation task failed: {err}"))?
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn spawn_windows_sandbox_session_elevated_for_permission_profile(
     permission_profile: &PermissionProfile,
@@ -153,7 +204,7 @@ pub(crate) async fn spawn_windows_sandbox_session_elevated_for_permission_profil
     codex_home: &Path,
     command: Vec<String>,
     cwd: &Path,
-    mut env_map: HashMap<String, String>,
+    env_map: HashMap<String, String>,
     proxy_enforced: bool,
     network_proxy_restricting_sid: Option<String>,
     proxy_settings_mode: crate::WindowsSandboxProxySettingsMode,
@@ -180,20 +231,24 @@ pub(crate) async fn spawn_windows_sandbox_session_elevated_for_permission_profil
             permission_profile,
             workspace_roots,
         )?;
-    let elevated = prepare_elevated_spawn_context_for_permissions(
-        permissions.clone(),
-        codex_home,
-        cwd,
-        &mut env_map,
-        &command,
-        read_roots_override,
-        read_roots_include_platform_defaults,
-        write_roots_override,
-        &deny_read_paths_override,
-        &deny_write_paths_override,
-        proxy_enforced,
-        proxy_settings_mode,
-    )?;
+    let (elevated, env_map) = prepare_elevated_spawn_context_off_runtime(
+        ElevatedPrepareRequest {
+            permissions: permissions.clone(),
+            codex_home: codex_home.to_path_buf(),
+            cwd: cwd.to_path_buf(),
+            env_map,
+            command: command.clone(),
+            read_roots_override: read_roots_override.map(<[PathBuf]>::to_vec),
+            read_roots_include_platform_defaults,
+            write_roots_override: write_roots_override.map(<[PathBuf]>::to_vec),
+            deny_read_paths_override: deny_read_paths_override.clone(),
+            deny_write_paths_override: deny_write_paths_override.clone(),
+            proxy_enforced,
+            proxy_settings_mode,
+        },
+        prepare_elevated_spawn_context_blocking,
+    )
+    .await?;
 
     let sandbox_creds = elevated.sandbox_creds;
     let request = RunnerTransportRequest {
