@@ -1,4 +1,6 @@
+use super::ElevatedPrepareRequest;
 use super::RunnerTransportRequest;
+use super::prepare_elevated_spawn_context_off_runtime;
 use super::spawn_runner_transport_with_retry;
 use crate::WindowsSandboxProxySettingsMode;
 use crate::identity::SandboxCreds;
@@ -18,6 +20,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::mpsc;
+use std::time::Duration;
 use tempfile::tempdir;
 use windows_sys::Win32::Foundation::ERROR_NO_SUCH_LOGON_SESSION;
 use windows_sys::Win32::Foundation::ERROR_SERVICE_ALREADY_RUNNING;
@@ -257,4 +261,44 @@ fn unified_exec_logon_1056_retries_original_request_and_runs_command_once() {
             .expect("read command launch marker"),
         "launched\r\n"
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn spawn_preparation_leaves_the_async_runtime_free() {
+    // Preparation can wait minutes for the sandbox setup helper. It must not hold the
+    // runtime thread meanwhile: a single-threaded runtime can only deliver this signal
+    // while preparation is blocked if preparation runs somewhere else.
+    let (signal_tx, signal_rx) = mpsc::channel();
+    let signal = tokio::spawn(async move {
+        signal_tx
+            .send(())
+            .expect("preparation is waiting for the signal");
+    });
+    let request = runner_transport_request();
+    let prepare_request = ElevatedPrepareRequest {
+        permissions: request.permissions,
+        codex_home: request.codex_home,
+        cwd: request.cwd,
+        env_map: request.env_map,
+        command: request.spawn_request.command,
+        read_roots_override: None,
+        read_roots_include_platform_defaults: false,
+        write_roots_override: None,
+        deny_read_paths_override: Vec::new(),
+        deny_write_paths_override: Vec::new(),
+        proxy_enforced: false,
+        proxy_settings_mode: request.proxy_settings_mode,
+    };
+
+    let prepared = prepare_elevated_spawn_context_off_runtime(prepare_request, move |request| {
+        signal_rx
+            .recv_timeout(Duration::from_secs(10))
+            .map_err(|err| anyhow::anyhow!("runtime starved while preparation blocked: {err}"))?;
+        Ok(request.cwd)
+    })
+    .await
+    .expect("preparation should finish once the runtime delivers the signal");
+
+    assert_eq!(PathBuf::from(r"C:\workspace"), prepared);
+    signal.await.expect("signal task");
 }
