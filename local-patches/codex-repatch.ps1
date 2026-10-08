@@ -59,6 +59,18 @@ function Invoke-Git {
     $out
 }
 
+function Set-MigrationLineEndings([string]$eol) {
+    # sqlx embeds a SHA-384 of each migration file and rejects a database whose recorded
+    # checksum differs. OpenAI builds Windows releases from a CRLF checkout, so ~/.codex
+    # databases carry CRLF checksums; an LF build fails with "failed to initialize state runtime".
+    Get-ChildItem (Join-Path $Repo 'codex-rs\state') -Directory -Filter '*migrations' |
+        Get-ChildItem -Filter '*.sql' | ForEach-Object {
+            $text = [IO.File]::ReadAllText($_.FullName) -replace "`r`n", "`n"
+            if ($eol -eq 'crlf') { $text = $text -replace "`n", "`r`n" }
+            [IO.File]::WriteAllText($_.FullName, $text)
+        }
+}
+
 function Remove-ParkedCopies([string]$dest) {
     $dir  = Split-Path $dest
     $leaf = Split-Path $dest -Leaf
@@ -130,12 +142,14 @@ if (-not $SkipBuild) {
     $cargoArgs = @('build', '--release') + ($Binaries | ForEach-Object { '--bin', $_.Bin })
     Push-Location (Join-Path $Repo 'codex-rs')
     try {
+        Set-MigrationLineEndings crlf
         $p = Start-Process cargo -ArgumentList $cargoArgs -NoNewWindow -PassThru
         $p.PriorityClass = 'BelowNormal'
         $p.WaitForExit()
         if ($p.ExitCode -ne 0) { throw "cargo build failed ($($p.ExitCode))" }
     } finally {
         Pop-Location
+        Set-MigrationLineEndings lf
         # Release tags stamp the version into Cargo.toml but not Cargo.lock, so cargo rewrites it.
         # Keep that on the local build branch so the checkout stays clean.
         if (& git -C $Repo status --porcelain -- codex-rs/Cargo.lock) {
@@ -148,6 +162,14 @@ if (-not $SkipBuild) {
 $codexBuilt = Join-Path $Release 'codex.exe'
 $reported = (& $codexBuilt --version).Trim()
 if ($reported -ne "codex-cli $Version") { throw "Built binary reports '$reported', expected 'codex-cli $Version'." }
+
+# T3 and the desktop app launch `codex app-server`; it must open the existing ~/.codex databases.
+# With stdin at EOF a healthy app-server exits 0; a migration checksum mismatch exits 1.
+$probe = Start-Process $codexBuilt -ArgumentList 'app-server' -NoNewWindow -PassThru -Wait `
+    -RedirectStandardInput (New-TemporaryFile) -RedirectStandardError ($probeErr = New-TemporaryFile)
+if ($probe.ExitCode -ne 0) {
+    throw "Built codex app-server exited $($probe.ExitCode): $((Get-Content $probeErr -Raw).Trim())"
+}
 
 foreach ($b in $Binaries) {
     $built  = Join-Path $Release "$($b.Bin).exe"
