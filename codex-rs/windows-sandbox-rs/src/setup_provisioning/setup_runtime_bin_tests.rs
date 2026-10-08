@@ -238,3 +238,41 @@ fn primary_runtime_path_does_not_depend_on_local_app_data() {
         vec![PathBuf::from(r"C:\Users\user\.cache\codex-runtimes")]
     );
 }
+
+#[test]
+fn runtime_repair_grants_access_to_a_running_executable() {
+    // The Codex desktop app keeps runtime executables such as node_repl.exe running. Windows
+    // refuses write-data opens of a mapped image, so the repair must not ask for more than
+    // the ACL rights it uses, or every sandbox setup refresh fails while the app is open.
+    let runtime = tempfile::tempdir().expect("runtime directory");
+    let exe = runtime.path().join("bin").join("node_repl.exe");
+    fs::create_dir_all(exe.parent().expect("parent")).expect("runtime bin");
+    let system_root = std::env::var_os("SystemRoot").expect("SystemRoot");
+    fs::copy(
+        PathBuf::from(system_root).join("System32").join("PING.EXE"),
+        &exe,
+    )
+    .expect("copy a runnable executable");
+    let mut running = std::process::Command::new(&exe)
+        .args(["-n", "30", "127.0.0.1"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("start runtime executable");
+    let sandbox_sid = LocalSid::from_string("S-1-5-21-10-20-30-41").expect("test SID");
+
+    let result = ensure_runtime_tree_readable(runtime.path(), sandbox_sid.as_ptr());
+    let granted = path_mask_allows(
+        &exe,
+        &[sandbox_sid.as_ptr()],
+        FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
+        /*require_all_bits*/ true,
+    );
+    let still_running = running.try_wait().expect("poll runtime executable").is_none();
+    let _ = running.kill();
+    let _ = running.wait();
+
+    assert!(still_running, "the executable must be running during the repair");
+    result.expect("repair a runtime tree while one of its executables runs");
+    assert!(granted.expect("read running executable ACL"));
+}
