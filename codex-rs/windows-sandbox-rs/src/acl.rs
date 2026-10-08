@@ -11,6 +11,7 @@ use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 use windows_sys::Win32::Foundation::CloseHandle;
+use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
 use windows_sys::Win32::Foundation::ERROR_SUCCESS;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Foundation::HLOCAL;
@@ -547,14 +548,23 @@ unsafe fn ensure_allow_mask_aces_with_inheritance_impl(
     inheritance: u32,
 ) -> Result<bool> {
     let directory = if inheritance == 0 {
-        Some(
+        let open = |access| {
             OpenOptions::new()
-                .access_mode(MAXIMUM_ALLOWED)
+                .access_mode(access)
                 .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
                 .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
                 .open(path)
-                .context("open ACL target for root-only update")?,
-        )
+        };
+        // MAXIMUM_ALLOWED includes write-data, which Windows refuses for a running
+        // executable image with a sharing violation. A file has no children to propagate
+        // to, so the two rights this update uses are enough there.
+        let handle = match open(MAXIMUM_ALLOWED) {
+            Err(err) if err.raw_os_error() == Some(ERROR_SHARING_VIOLATION as i32) => {
+                open(READ_CONTROL | WRITE_DAC)
+            }
+            result => result,
+        };
+        Some(handle.context("open ACL target for root-only update")?)
     } else {
         None
     };
